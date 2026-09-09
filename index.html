@@ -162,6 +162,11 @@
     background: #4a1f22; color: #ffd7d7; border: 1px solid #7a2e33;
     padding: 10px 14px; border-radius: 10px; font-size: 13px; line-height: 1.4;
   }
+  .error-action {
+    margin-top: 10px; background: #7a2e33; color: #ffe9e9;
+    padding: 7px 12px; border-radius: 7px; font-size: 13px; font-weight: 600;
+  }
+  .error-action:active { opacity: 0.8; }
 
   #fileInput { display: none; }
 </style>
@@ -170,7 +175,7 @@
 <div id="app">
   <header>
     <h1>Visor DWG</h1>
-    <span id="version">v4</span>
+    <span id="version">v6</span>
     <div id="fileName"></div>
     <label id="openBtn" for="fileInput">Abrir archivo</label>
   </header>
@@ -7122,11 +7127,35 @@ let LibreDwg = _LibreDwg;
   // Grosor de línea deseado EN PANTALLA (px), constante a cualquier zoom.
   const LINE_PX = 1.1;
 
-  // El motor necesita del orden de 120 veces el tamaño del archivo en memoria.
-  // Por encima de este tamaño el navegador del móvil se queda sin memoria y
-  // cierra la app, así que avisamos antes en vez de dejar que reviente.
-  const MAX_MB = 8;
-  const WARN_MB = 3;
+  // Cuánta memoria consume el motor por cada MB de archivo. Medido sobre un
+  // plano real de 22 MB: la lectura consumió ~2,8 GB (unas 123 veces).
+  const MEM_RATIO = 123;
+
+  // El presupuesto de memoria disponible NO es igual en todos los dispositivos,
+  // así que el tamaño máximo de plano se calcula según el aparato en vez de
+  // usar un tope fijo. En iOS, Safari no expone ninguna API de memoria y
+  // además es el entorno más restrictivo, de ahí el presupuesto conservador.
+  function memoryBudgetMB() {
+    const ua = navigator.userAgent || '';
+    const isIOS = /iPad|iPhone|iPod/.test(ua) ||
+                  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    if (isIOS) return { mb: 1100, origen: 'iPhone/iPad (límite de Safari)' };
+
+    // Chrome (Android y escritorio) sí informa de la memoria del dispositivo.
+    const dm = navigator.deviceMemory;            // en GiB, redondeado por el navegador
+    if (dm) {
+      return { mb: Math.min(dm * 1024 * 0.30, 3000), origen: 'dispositivo con ~' + dm + ' GB de RAM' };
+    }
+    const heap = (window.performance && performance.memory && performance.memory.jsHeapSizeLimit);
+    if (heap) {
+      return { mb: Math.min(heap / 1048576 * 0.85, 3000), origen: 'límite de memoria del navegador' };
+    }
+    return { mb: 1400, origen: 'estimación por omisión' };
+  }
+
+  const BUDGET = memoryBudgetMB();
+  const MAX_MB = BUDGET.mb / MEM_RATIO;   // tamaño de archivo que cabe en ese presupuesto
+  const WARN_MB = MAX_MB * 0.5;
 
   const els = {
     fileInput: document.getElementById('fileInput'),
@@ -7161,11 +7190,25 @@ let LibreDwg = _LibreDwg;
     els.statusText.textContent = msg || '';
   }
 
-  function showError(msg) {
+  function showError(msg, accion) {
     els.error.style.display = 'block';
     els.error.textContent = msg;
     clearTimeout(showError._t);
-    showError._t = setTimeout(() => { els.error.style.display = 'none'; }, 15000);
+    if (accion) {
+      // Aviso con opción de intentarlo igualmente: el cálculo de memoria es una
+      // estimación, así que la decisión final se deja en manos del usuario.
+      const btn = document.createElement('button');
+      btn.textContent = accion.texto;
+      btn.className = 'error-action';
+      btn.addEventListener('click', () => {
+        els.error.style.display = 'none';
+        accion.fn();
+      });
+      els.error.appendChild(document.createElement('br'));
+      els.error.appendChild(btn);
+    } else {
+      showError._t = setTimeout(() => { els.error.style.display = 'none'; }, 15000);
+    }
   }
 
   window.addEventListener('error', (evt) => {
@@ -7264,8 +7307,12 @@ let LibreDwg = _LibreDwg;
 
   /* ---------- Reducción del tamaño del SVG ---------- */
   function shrinkSvgNumbers(svgString, bboxDiag) {
-    let decimals = 6 - Math.floor(Math.log10(Math.max(bboxDiag, 1e-9)));
-    decimals = Math.max(0, Math.min(6, decimals));
+    // Se conservan ~10 cifras significativas respecto al tamaño del dibujo.
+    // (Antes se guardaban solo 6, lo que en planos con coordenadas grandes
+    // —milímetros o coordenadas UTM— dejaba CERO decimales: al ampliar mucho
+    // la geometría se deformaba y las líneas finas desaparecían.)
+    let decimals = 9 - Math.floor(Math.log10(Math.max(bboxDiag, 1e-9)));
+    decimals = Math.max(2, Math.min(6, decimals));
     return svgString.replace(/-?\d+\.\d{3,}/g, (m) => {
       const v = parseFloat(m);
       let s = v.toFixed(decimals);
@@ -7487,7 +7534,7 @@ let LibreDwg = _LibreDwg;
   });
 
   /* ==================== Carga y render de archivo ==================== */
-  async function handleFile(file) {
+  async function handleFile(file, forzar) {
     els.error.style.display = 'none';
     showLayer(null);
     els.fileName.textContent = file.name;
@@ -7499,9 +7546,14 @@ let LibreDwg = _LibreDwg;
       showError('Este visor solo admite archivos DWG. El motor de lectura no soporta DXF todavía.');
       return;
     }
-    if (sizeMB > MAX_MB) {
-      showError('Este plano pesa ' + sizeMB.toFixed(1) + ' MB. El motor de lectura necesita unas 120 veces el tamaño del archivo en memoria (unos ' +
-        Math.round(sizeMB * 120 / 1024) + ' GB), muy por encima de lo que permite un móvil: se cerraría la app. El límite práctico son unos ' + MAX_MB + ' MB.');
+    if (sizeMB > MAX_MB && !forzar) {
+      showError(
+        'Este plano pesa ' + sizeMB.toFixed(1) + ' MB y el motor necesitaría unos ' +
+        (sizeMB * MEM_RATIO / 1024).toFixed(1) + ' GB de memoria para leerlo. Aquí hay disponibles unos ' +
+        (BUDGET.mb / 1024).toFixed(1) + ' GB (' + BUDGET.origen + '), lo que da para planos de hasta ~' +
+        MAX_MB.toFixed(0) + ' MB. Es una estimación: puedes intentarlo, pero si se agota la memoria la app se cerrará.',
+        { texto: 'Intentar de todos modos', fn: () => handleFile(file, true) }
+      );
       return;
     }
 
