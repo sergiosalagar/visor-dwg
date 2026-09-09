@@ -66,6 +66,21 @@
   #viewport {
     position: absolute; inset: 0; overflow: hidden;
     touch-action: none; cursor: grab;
+  }
+  /* El escenario ocupa todo el viewport: el zoom se aplica cambiando el
+     viewBox del SVG (se redibuja nítido), no con transformaciones CSS. */
+  #stage {
+    position: absolute; inset: 0;
+  }
+  #stage svg { display: block; width: 100%; height: 100%; }
+
+  /* ---- Fondos seleccionables ----
+     Con fondo oscuro/negro, los elementos que el DWG deja en negro (el color
+     por omisión) serían invisibles, así que se pasan a claro. Con fondo blanco
+     se hace lo contrario con los blancos. Es lo mismo que hace AutoCAD al
+     cambiar el color del espacio de trabajo. */
+  #viewport[data-bg="oscuro"] {
+    background-color: #101114;
     background-image:
       linear-gradient(45deg, #17181b 25%, transparent 25%),
       linear-gradient(-45deg, #17181b 25%, transparent 25%),
@@ -74,12 +89,30 @@
     background-size: 24px 24px;
     background-position: 0 0, 0 12px, 12px -12px, -12px 0px;
   }
-  /* El escenario ocupa todo el viewport: el zoom se aplica cambiando el
-     viewBox del SVG (se redibuja nítido), no con transformaciones CSS. */
-  #stage {
-    position: absolute; inset: 0;
+  #viewport[data-bg="negro"] { background: #000; background-image: none; }
+  #viewport[data-bg="blanco"] { background: #fff; background-image: none; }
+
+  #viewport[data-bg="oscuro"] [stroke="#000000"],
+  #viewport[data-bg="negro"] [stroke="#000000"] { stroke: #e8e9ec; }
+  #viewport[data-bg="oscuro"] [fill="#000000"],
+  #viewport[data-bg="negro"] [fill="#000000"] { fill: #e8e9ec; }
+
+  #viewport[data-bg="blanco"] [stroke="rgb(255,255,255)"] { stroke: #111; }
+  #viewport[data-bg="blanco"] [fill="rgb(255,255,255)"] { fill: #111; }
+  #viewport[data-bg="blanco"] [stroke="rgb(255,255,0)"] { stroke: #9a8b00; }
+  #viewport[data-bg="blanco"] [fill="rgb(255,255,0)"] { fill: #9a8b00; }
+
+  /* Etiqueta con la capa del elemento tocado */
+  #layerInfo {
+    display: none; position: absolute; left: 12px;
+    bottom: max(16px, env(safe-area-inset-bottom));
+    z-index: 6; max-width: 60%;
+    background: rgba(36,38,43,0.94); color: var(--text);
+    border: 1px solid var(--border); border-radius: 9px;
+    padding: 8px 12px; font-size: 13px; font-weight: 600;
+    backdrop-filter: blur(6px);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  #stage svg { display: block; width: 100%; height: 100%; }
 
   #emptyState {
     position: absolute; inset: 0; display: flex; flex-direction: column;
@@ -137,7 +170,7 @@
 <div id="app">
   <header>
     <h1>Visor DWG</h1>
-    <span id="version">v3</span>
+    <span id="version">v4</span>
     <div id="fileName"></div>
     <label id="openBtn" for="fileInput">Abrir archivo</label>
   </header>
@@ -149,7 +182,7 @@
 
     <div id="emptyState">
       <div class="icon">▦</div>
-      <p>Abre un plano DWG para verlo. Todo se procesa en tu dispositivo, sin subir nada a internet.</p>
+      <p>Abre un plano DWG para verlo. Toca un elemento para ver su capa. Todo se procesa en tu dispositivo, sin subir nada a internet.</p>
       <label class="big-open" for="fileInput">Elegir archivo</label>
     </div>
 
@@ -157,7 +190,10 @@
       <button id="zoomInBtn">+</button>
       <button id="zoomOutBtn">–</button>
       <button id="fitBtn">⤢</button>
+      <button id="bgBtn">◐</button>
     </div>
+
+    <div id="layerInfo"></div>
 
     <div id="status">
       <div class="spinner"></div>
@@ -7083,13 +7119,17 @@ let LibreDwg = _LibreDwg;
 
   const WASM_B64 = window.__DWG_WASM_B64__;
 
-  // Grosor de línea deseado EN PANTALLA (px). Se mantiene constante a
-  // cualquier nivel de zoom recalculando stroke-width en unidades de dibujo.
+  // Grosor de línea deseado EN PANTALLA (px), constante a cualquier zoom.
   const LINE_PX = 1.1;
+
+  // El motor necesita del orden de 120 veces el tamaño del archivo en memoria.
+  // Por encima de este tamaño el navegador del móvil se queda sin memoria y
+  // cierra la app, así que avisamos antes en vez de dejar que reviente.
+  const MAX_MB = 8;
+  const WARN_MB = 3;
 
   const els = {
     fileInput: document.getElementById('fileInput'),
-    openBtn: document.getElementById('openBtn'),
     fileName: document.getElementById('fileName'),
     viewport: document.getElementById('viewport'),
     stage: document.getElementById('stage'),
@@ -7099,8 +7139,10 @@ let LibreDwg = _LibreDwg;
     zoomInBtn: document.getElementById('zoomInBtn'),
     zoomOutBtn: document.getElementById('zoomOutBtn'),
     fitBtn: document.getElementById('fitBtn'),
+    bgBtn: document.getElementById('bgBtn'),
     emptyState: document.getElementById('emptyState'),
-    toolbar: document.getElementById('toolbar')
+    toolbar: document.getElementById('toolbar'),
+    layerInfo: document.getElementById('layerInfo')
   };
 
   let libredwg = null;
@@ -7122,11 +7164,10 @@ let LibreDwg = _LibreDwg;
   function showError(msg) {
     els.error.style.display = 'block';
     els.error.textContent = msg;
-    setTimeout(() => { els.error.style.display = 'none'; }, 12000);
+    clearTimeout(showError._t);
+    showError._t = setTimeout(() => { els.error.style.display = 'none'; }, 15000);
   }
 
-  // Red de seguridad: si algo falla fuera de nuestros try/catch, lo mostramos
-  // en pantalla en vez de dejar la app colgada en silencio.
   window.addEventListener('error', (evt) => {
     setStatus('');
     showError('Error inesperado: ' + (evt.message || evt.error || 'desconocido'));
@@ -7137,11 +7178,11 @@ let LibreDwg = _LibreDwg;
     showError('Error inesperado: ' + reason);
   });
 
-  async function ensureLibredwg(silent) {
+  async function ensureLibredwg() {
     if (libredwg) return libredwg;
     if (!libredwgReady) {
       libredwgReady = (async () => {
-        if (!silent) setStatus('Cargando motor DWG…');
+        setStatus('Cargando motor DWG…');
         const wasmBinary = base64ToUint8Array(WASM_B64);
         const wasmInstance = await createModule({ wasmBinary });
         libredwg = LibreDwg.createByWasmInstance(wasmInstance);
@@ -7151,7 +7192,27 @@ let LibreDwg = _LibreDwg;
     return libredwgReady;
   }
 
-  /* ---------- Tipos de línea: patrón de guiones desde la tabla LTYPE ---------- */
+  /* ==================== Fondo (oscuro / negro / blanco) ==================== */
+  // El remapeo de colores negro<->blanco se hace por CSS, con selectores sobre
+  // el atributo stroke/fill que escribe la librería, igual que hace AutoCAD al
+  // cambiar el color de fondo del espacio de trabajo.
+  const BACKGROUNDS = ['oscuro', 'negro', 'blanco'];
+  const BG_LABEL = { oscuro: 'Fondo oscuro', negro: 'Fondo negro', blanco: 'Fondo blanco' };
+  let bgIndex = 0;
+
+  function applyBackground() {
+    const bg = BACKGROUNDS[bgIndex];
+    els.viewport.setAttribute('data-bg', bg);
+    els.bgBtn.title = BG_LABEL[bg];
+  }
+
+  els.bgBtn.addEventListener('click', () => {
+    bgIndex = (bgIndex + 1) % BACKGROUNDS.length;
+    applyBackground();
+  });
+  applyBackground();
+
+  /* ---------- Tipos de línea desde la tabla LTYPE ---------- */
   function buildLtypeMap(db) {
     const map = new Map();
     const entries = (db.tables && db.tables.LTYPE && db.tables.LTYPE.entries) || [];
@@ -7188,14 +7249,12 @@ let LibreDwg = _LibreDwg;
     const ltypeMap = buildLtypeMap(db);
     const layerMap = buildLayerMap(db);
     const dotSize = Math.max(bboxDiag * 0.0008, 1e-6);
-
     const dashByHandle = new Map();
     for (const entity of db.entities) {
       const dash = resolveDashArray(entity, ltypeMap, layerMap, dotSize);
       if (dash) dashByHandle.set(entity.handle, dash);
     }
     if (dashByHandle.size === 0) return svgString;
-
     return svgString.replace(/id="([0-9A-Fa-f]+)" stroke="/g, (match, handle) => {
       const dash = dashByHandle.get(handle);
       if (!dash) return match;
@@ -7203,12 +7262,7 @@ let LibreDwg = _LibreDwg;
     });
   }
 
-  /* ---------- Reducción del tamaño del SVG ----------
-     La librería escribe las coordenadas con toda la precisión de coma flotante
-     (17 dígitos), lo que más que duplica el tamaño del SVG y del DOM
-     resultante. Con planos grandes eso es lo que agota la memoria del móvil.
-     Redondeamos a una precisión suficiente en relación al tamaño del dibujo
-     (unas 6 cifras significativas respecto a su diagonal). */
+  /* ---------- Reducción del tamaño del SVG ---------- */
   function shrinkSvgNumbers(svgString, bboxDiag) {
     let decimals = 6 - Math.floor(Math.log10(Math.max(bboxDiag, 1e-9)));
     decimals = Math.max(0, Math.min(6, decimals));
@@ -7226,38 +7280,38 @@ let LibreDwg = _LibreDwg;
     return { x: parseFloat(m[1]), y: parseFloat(m[2]), w: parseFloat(m[3]), h: parseFloat(m[4]) };
   }
 
-  /* ==================== Vista: zoom y desplazamiento por viewBox ====================
-     El zoom se aplica cambiando el viewBox del propio SVG, no con una
-     transformación CSS. Así el navegador redibuja los vectores nítidos a
-     cualquier aumento (con CSS transform se rasteriza: se ve borroso y con las
-     líneas engordadas), y podemos recalcular el grosor de línea para que se
-     mantenga constante en pantalla. */
-  const view = {
-    cx: 0,          // centro de la vista, en unidades de dibujo
-    cy: 0,
-    scale: 1,       // píxeles de pantalla por unidad de dibujo
-    minScale: 1e-9,
-    maxScale: 1e9
-  };
+  /* ==================== Vista: zoom y desplazamiento por viewBox ==================== */
+  const view = { cx: 0, cy: 0, scale: 1, minScale: 1e-9, maxScale: 1e9 };
 
-  let svgEl = null;       // <svg> actual
-  let rootGroup = null;   // grupo raíz, del que se hereda el stroke-width
-  let drawingBox = null;  // bbox original del dibujo
+  let svgEl = null;
+  let rootGroup = null;
+  let drawingBox = null;
+  let layerByHandle = new Map();
 
   function viewportSize() {
     const r = els.viewport.getBoundingClientRect();
     return { w: Math.max(r.width, 1), h: Math.max(r.height, 1) };
   }
 
-  function applyView() {
+  // El repintado se agrupa en un requestAnimationFrame: con planos grandes,
+  // actualizar el viewBox en cada evento de dedo saturaba el navegador y el
+  // movimiento se sentía a tirones.
+  let rafPending = false;
+  function scheduleView() {
+    if (rafPending) return;
+    rafPending = true;
+    requestAnimationFrame(() => {
+      rafPending = false;
+      applyViewNow();
+    });
+  }
+
+  function applyViewNow() {
     if (!svgEl) return;
     const vp = viewportSize();
     const w = vp.w / view.scale;
     const h = vp.h / view.scale;
-    const x = view.cx - w / 2;
-    const y = view.cy - h / 2;
-    svgEl.setAttribute('viewBox', x + ' ' + y + ' ' + w + ' ' + h);
-    // Grosor constante en pantalla: en unidades de dibujo es px / escala.
+    svgEl.setAttribute('viewBox', (view.cx - w / 2) + ' ' + (view.cy - h / 2) + ' ' + w + ' ' + h);
     if (rootGroup) rootGroup.setAttribute('stroke-width', LINE_PX / view.scale);
   }
 
@@ -7268,41 +7322,74 @@ let LibreDwg = _LibreDwg;
     view.scale = (s > 0 && isFinite(s)) ? s : 1;
     view.cx = drawingBox.x + drawingBox.w / 2;
     view.cy = drawingBox.y + drawingBox.h / 2;
-    applyView();
+    applyViewNow();
   }
 
-  // Zoom manteniendo fijo el punto (px, py) de la pantalla
   function zoomBy(factor, px, py) {
     if (!svgEl) return;
     const vp = viewportSize();
     if (px == null) px = vp.w / 2;
     if (py == null) py = vp.h / 2;
-
     const newScale = Math.max(view.minScale, Math.min(view.maxScale, view.scale * factor));
     if (newScale === view.scale) return;
-
-    // punto del dibujo que ahora mismo está bajo (px, py)
     const ux = view.cx - (vp.w / view.scale) / 2 + px / view.scale;
     const uy = view.cy - (vp.h / view.scale) / 2 + py / view.scale;
-
     view.scale = newScale;
-    // recolocamos el centro para que ese mismo punto siga bajo (px, py)
     view.cx = ux - px / newScale + (vp.w / newScale) / 2;
     view.cy = uy - py / newScale + (vp.h / newScale) / 2;
-    applyView();
+    scheduleView();
   }
 
   function panByPixels(dxPx, dyPx) {
     if (!svgEl) return;
     view.cx -= dxPx / view.scale;
     view.cy -= dyPx / view.scale;
-    applyView();
+    scheduleView();
+  }
+
+  /* ==================== Consulta de capa al tocar ==================== */
+  function showLayer(name) {
+    if (!name) {
+      els.layerInfo.style.display = 'none';
+      return;
+    }
+    els.layerInfo.style.display = 'block';
+    els.layerInfo.textContent = 'Capa: ' + name;
+  }
+
+  // Busca la entidad bajo el punto tocado. Como las líneas son finas y en un
+  // móvil el dedo es impreciso, se muestrea una rejilla de puntos alrededor
+  // del toque y se coge el primer acierto.
+  function findLayerAt(clientX, clientY) {
+    if (!layerByHandle.size) return null;
+    const offsets = [0, 5, 10, 16, 22];
+    for (const r of offsets) {
+      const pts = r === 0 ? [[0, 0]] : [
+        [0, -r], [0, r], [-r, 0], [r, 0],
+        [-r, -r], [r, -r], [-r, r], [r, r]
+      ];
+      for (const [dx, dy] of pts) {
+        const hits = document.elementsFromPoint(clientX + dx, clientY + dy) || [];
+        for (const hit of hits) {
+          if (!els.stage.contains(hit)) continue;
+          let node = hit;
+          while (node && node !== els.stage) {
+            if (node.id && layerByHandle.has(node.id)) {
+              return layerByHandle.get(node.id);
+            }
+            node = node.parentNode;
+          }
+        }
+      }
+    }
+    return null;
   }
 
   /* ---------- Gestos táctiles / ratón ---------- */
   const pointers = new Map();
-  let lastPinchDist = null;
+  let gesture = null;      // estado del gesto de dos dedos
   let lastPanPoint = null;
+  let pressStart = null;   // para distinguir un toque de un arrastre
 
   function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
   function mid(a, b) { return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; }
@@ -7314,13 +7401,18 @@ let LibreDwg = _LibreDwg;
 
   els.viewport.addEventListener('pointerdown', (evt) => {
     els.viewport.setPointerCapture(evt.pointerId);
-    pointers.set(evt.pointerId, getLocalPoint(evt));
+    const p = getLocalPoint(evt);
+    pointers.set(evt.pointerId, p);
+
     if (pointers.size === 1) {
-      lastPanPoint = getLocalPoint(evt);
+      lastPanPoint = p;
+      pressStart = { x: evt.clientX, y: evt.clientY, t: Date.now(), moved: false };
+      gesture = null;
     } else if (pointers.size === 2) {
       const pts = Array.from(pointers.values());
-      lastPinchDist = dist(pts[0], pts[1]);
+      gesture = { d: dist(pts[0], pts[1]), m: mid(pts[0], pts[1]) };
       lastPanPoint = null;
+      if (pressStart) pressStart.moved = true;   // ya no es un toque simple
     }
   });
 
@@ -7330,29 +7422,53 @@ let LibreDwg = _LibreDwg;
 
     if (pointers.size === 1 && lastPanPoint) {
       const p = getLocalPoint(evt);
-      panByPixels(p.x - lastPanPoint.x, p.y - lastPanPoint.y);
+      const dx = p.x - lastPanPoint.x;
+      const dy = p.y - lastPanPoint.y;
+      if (pressStart && Math.hypot(evt.clientX - pressStart.x, evt.clientY - pressStart.y) > 8) {
+        pressStart.moved = true;
+      }
+      panByPixels(dx, dy);
       lastPanPoint = p;
-    } else if (pointers.size === 2) {
+    } else if (pointers.size === 2 && gesture) {
       const pts = Array.from(pointers.values());
       const d = dist(pts[0], pts[1]);
       const m = mid(pts[0], pts[1]);
-      if (lastPinchDist && d > 0) zoomBy(d / lastPinchDist, m.x, m.y);
-      lastPinchDist = d;
+      // El pellizco hace zoom y a la vez arrastra: si no se tiene en cuenta el
+      // desplazamiento del punto medio, el dibujo "se escapa" bajo los dedos.
+      if (gesture.d > 0 && d > 0) {
+        panByPixels(m.x - gesture.m.x, m.y - gesture.m.y);
+        zoomBy(d / gesture.d, m.x, m.y);
+      }
+      gesture = { d: d, m: m };
     }
   });
 
   function endPointer(evt) {
+    const wasSingle = pointers.size === 1;
     pointers.delete(evt.pointerId);
-    if (pointers.size < 2) lastPinchDist = null;
+
+    if (pointers.size < 2) gesture = null;
     if (pointers.size === 1) {
+      // al levantar un dedo del pellizco, reanclamos el paneo para no dar un salto
       lastPanPoint = Array.from(pointers.values())[0];
     } else if (pointers.size === 0) {
       lastPanPoint = null;
+      // Toque simple sin arrastre: consultar la capa del elemento tocado
+      if (wasSingle && pressStart && !pressStart.moved && (Date.now() - pressStart.t) < 700) {
+        const layer = findLayerAt(pressStart.x, pressStart.y);
+        showLayer(layer || null);
+        if (!layer) {
+          els.layerInfo.style.display = 'block';
+          els.layerInfo.textContent = 'Sin elemento en ese punto';
+          clearTimeout(findLayerAt._t);
+          findLayerAt._t = setTimeout(() => { els.layerInfo.style.display = 'none'; }, 2000);
+        }
+      }
+      pressStart = null;
     }
   }
   els.viewport.addEventListener('pointerup', endPointer);
   els.viewport.addEventListener('pointercancel', endPointer);
-  els.viewport.addEventListener('pointerleave', endPointer);
 
   els.viewport.addEventListener('wheel', (evt) => {
     evt.preventDefault();
@@ -7360,65 +7476,69 @@ let LibreDwg = _LibreDwg;
     zoomBy(evt.deltaY < 0 ? 1.12 : 1 / 1.12, p.x, p.y);
   }, { passive: false });
 
-  let lastTap = 0;
-  els.viewport.addEventListener('pointerup', (evt) => {
-    if (pointers.size !== 0) return;
-    const now = Date.now();
-    const p = getLocalPoint(evt);
-    if (now - lastTap < 300) zoomBy(1.8, p.x, p.y);
-    lastTap = now;
-  });
-
   els.zoomInBtn.addEventListener('click', () => zoomBy(1.3));
   els.zoomOutBtn.addEventListener('click', () => zoomBy(1 / 1.3));
   els.fitBtn.addEventListener('click', () => fitToViewport());
 
-  window.addEventListener('resize', () => applyView());
+  let resizeTimer = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => applyViewNow(), 120);
+  });
 
   /* ==================== Carga y render de archivo ==================== */
   async function handleFile(file) {
     els.error.style.display = 'none';
+    showLayer(null);
     els.fileName.textContent = file.name;
-    setStatus('Leyendo archivo…');
-    try {
-      const lower = file.name.toLowerCase();
-      // El motor LibreDWG-web tiene la lectura de DXF deshabilitada en su
-      // código (la rama DXF está comentada en la librería), así que un DXF
-      // fallaría con un error incomprensible. Mejor avisar con claridad.
-      if (lower.endsWith('.dxf')) {
-        throw new Error('Este visor solo admite archivos DWG. El motor de lectura no soporta DXF todavía.');
-      }
 
+    const sizeMB = file.size / 1024 / 1024;
+    const lower = file.name.toLowerCase();
+
+    if (lower.endsWith('.dxf')) {
+      showError('Este visor solo admite archivos DWG. El motor de lectura no soporta DXF todavía.');
+      return;
+    }
+    if (sizeMB > MAX_MB) {
+      showError('Este plano pesa ' + sizeMB.toFixed(1) + ' MB. El motor de lectura necesita unas 120 veces el tamaño del archivo en memoria (unos ' +
+        Math.round(sizeMB * 120 / 1024) + ' GB), muy por encima de lo que permite un móvil: se cerraría la app. El límite práctico son unos ' + MAX_MB + ' MB.');
+      return;
+    }
+
+    setStatus(sizeMB > WARN_MB ? 'Leyendo archivo (es grande, puede tardar)…' : 'Leyendo archivo…');
+    try {
       const buf = await file.arrayBuffer();
       const lw = await ensureLibredwg();
       setStatus('Analizando geometría…');
 
-      let svgString, box;
+      let svgString, box, handleLayers;
       try {
         const dwgPtr = lw.dwg_read_data(buf, Dwg_File_Type.DWG);
         if (!dwgPtr) throw new Error('lectura vacía');
         const db = lw.convert(dwgPtr);
         if (!db || !db.entities) throw new Error('documento vacío o sin entidades');
 
+        // Mapa handle -> capa, para poder responder al toque después
+        handleLayers = new Map();
+        for (const e of db.entities) {
+          if (e.handle) handleLayers.set(e.handle, e.layer || '0');
+        }
+
         setStatus('Generando dibujo…');
         svgString = lw.dwg_to_svg(db);
         box = parseViewBox(svgString);
         const bboxDiag = box ? Math.hypot(box.w, box.h) : 1000;
-
-        // Primero encogemos el SVG (así el paso siguiente usa menos memoria),
-        // después inyectamos los tipos de línea.
         svgString = shrinkSvgNumbers(svgString, bboxDiag);
         svgString = injectDashArrays(svgString, db, bboxDiag);
 
-        // Liberamos la memoria nativa del DWG: ya tenemos el SVG.
         try { lw.dwg_free(dwgPtr); } catch (e) { /* no crítico */ }
       } catch (innerErr) {
-        console.error('Fallo al procesar el DWG/DXF:', innerErr);
-        throw new Error('No se ha podido procesar el archivo. Puede estar dañado, ser demasiado grande para la memoria del móvil, o usar alguna función no soportada por este visor.');
+        console.error('Fallo al procesar el DWG:', innerErr);
+        throw new Error('No se ha podido procesar el archivo. Puede estar dañado, ser demasiado grande para la memoria del móvil, o usar alguna función no soportada.');
       }
 
-      renderSvg(svgString, box);
-      svgString = null; // liberar la cadena grande
+      renderSvg(svgString, box, handleLayers);
+      svgString = null;
 
       els.emptyState.style.display = 'none';
       els.toolbar.style.display = 'flex';
@@ -7430,12 +7550,11 @@ let LibreDwg = _LibreDwg;
     }
   }
 
-  function renderSvg(svgString, box) {
+  function renderSvg(svgString, box, handleLayers) {
     els.stage.innerHTML = svgString;
     svgEl = els.stage.querySelector('svg');
     if (!svgEl) return;
 
-    // El SVG ocupa todo el viewport; el zoom se hace moviendo su viewBox.
     svgEl.removeAttribute('width');
     svgEl.removeAttribute('height');
     svgEl.setAttribute('preserveAspectRatio', 'xMidYMid meet');
@@ -7443,17 +7562,35 @@ let LibreDwg = _LibreDwg;
     svgEl.style.height = '100%';
     svgEl.style.display = 'block';
 
-    // Grupo raíz: es donde la librería pone el stroke-width que heredan todos
-    // los elementos, así que es el único sitio que hay que ajustar.
-    rootGroup = svgEl.querySelector('g');
+    // OJO: el SVG empieza con un <defs> que contiene grupos de bloques, así que
+    // un querySelector('g') a secas devuelve uno de esos y no el grupo de
+    // dibujo real. Hay que coger el <g> que es hijo directo del <svg>.
+    rootGroup = null;
+    for (const child of svgEl.children) {
+      if (child.tagName && child.tagName.toLowerCase() === 'g') { rootGroup = child; break; }
+    }
     if (rootGroup) rootGroup.removeAttribute('stroke-width');
 
+    // Los textos se dibujaban sin relleno, así que salían "contorneados" con el
+    // grosor de línea (se veían gruesos y borrosos). Los pasamos a relleno
+    // sólido del color que les corresponde por capa.
+    const texts = svgEl.querySelectorAll('text');
+    for (const t of texts) {
+      let color = null;
+      let node = t.parentNode;
+      while (node && node !== svgEl && !color) {
+        if (node.getAttribute) color = node.getAttribute('stroke');
+        node = node.parentNode;
+      }
+      t.setAttribute('fill', color || '#000000');
+      t.setAttribute('stroke', 'none');
+    }
+
+    layerByHandle = handleLayers || new Map();
     drawingBox = box;
     fitToViewport();
   }
 
-  // El botón de abrir es un <label for="fileInput">, así que el navegador
-  // conecta el toque con el selector de archivos de forma nativa.
   els.fileInput.addEventListener('change', () => {
     const file = els.fileInput.files && els.fileInput.files[0];
     if (file) handleFile(file);
